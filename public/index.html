@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ЭкоКвест</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<style>
+body{background:#ecfdf5;font-family:'Nunito',system-ui,sans-serif;color:#1c3d2e}
+.btn{padding:.9rem 1.2rem;border-radius:1rem;color:#fff;font-weight:900;text-transform:uppercase;box-shadow:0 4px rgba(0,0,0,.25);transition:.1s}
+.btn:active{transform:translateY(3px);box-shadow:0 1px rgba(0,0,0,.25)}
+.btn:disabled{background:#d6d3d1!important;box-shadow:0 4px #a8a29e}
+.inp{width:100%;padding:.8rem 1rem;margin:.3rem 0;border:2px solid #d6d3d1;border-radius:1rem;background:#fff}
+.bar{height:14px;background:#e7e5e4;border-radius:9px;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#84cc16);border-radius:9px;transition:width .3s}
+.bar.t i{background:#38bdf8;transition:width .1s linear}
+.circ{width:84px;height:84px;border-radius:50%;font-size:2.4rem;box-shadow:0 6px rgba(0,0,0,.25)}
+.circ.on{background:#22c55e;animation:bob 2s infinite}.circ.off{background:#d6d3d1}.circ.gold{background:#facc15}
+.dot{width:10px;height:10px;border-radius:50%;background:#d6d3d1}.dot.f{background:#22c55e}
+.opt,.chip{display:block;width:100%;text-align:left;padding:.8rem 1rem;margin:.4rem 0;border:2px solid #d6d3d1;border-bottom-width:4px;border-radius:1rem;background:#fff;font-weight:700}
+.chip{display:inline-block;width:auto;margin:.2rem;padding:.4rem .8rem;cursor:grab}
+.sel{border-color:#38bdf8;background:#e0f2fe}.opt:disabled{opacity:.4}
+.bin{min-height:110px;padding:.5rem;border:3px dashed #86efac;border-radius:1rem;background:#fff}
+.fb{margin-top:1rem;padding:1rem;border-radius:1rem;font-weight:800}.good{background:#dcfce7;color:#166534}.bad{background:#fee2e2;color:#991b1b}
+.badge{padding:1rem;border-radius:1.2rem;background:#fff;box-shadow:0 4px #d6d3d1;display:flex;flex-direction:column;align-items:center;gap:.2rem;text-align:center;font-size:.85rem}
+.cert{background:#fff;border-radius:1.5rem;padding:2rem;text-align:center;max-width:26rem;width:100%;border:8px solid #22c55e}
+.cert.big{border-color:#facc15;background:linear-gradient(#fef9c3,#fff);max-width:32rem;padding:3rem 2rem}
+.xp{font-size:3.5rem;font-weight:900;color:#f59e0b;animation:up .8s}.pop{animation:pop .3s}
+.quiz{user-select:none;-webkit-user-select:none}
+@keyframes bob{50%{transform:translateY(-5px)}}@keyframes pop{from{transform:scale(.8);opacity:0}}@keyframes up{from{transform:translateY(40px) scale(.5);opacity:0}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style></head>
+<body><div id="app"></div>
+<script>
+const $ = s => document.querySelector(s), app = $('#app');
+const api = (p, b) => fetch('/api/' + p, { method: b ? 'POST' : 'GET', headers: { 'Content-Type': 'application/json' }, body: b ? JSON.stringify(b) : undefined })
+  .then(async r => ({ ...(await r.json().catch(() => ({}))), ok: r.ok }));
+const BR = { m: ['🌳', 'Основной путь'], w: ['💧', 'Вода'], t: ['♻️', 'Отходы'], e: ['⚡', 'Энергия'], b: ['🦋', 'Биоразнообразие'] };
+let S, tab = 'path', run = null, tm, ans, cur = null;
+
+function toast(m) { const d = document.createElement('div'); d.className = 'fixed top-4 inset-x-4 z-50 mx-auto max-w-sm bg-stone-800 text-white p-3 rounded-xl text-center font-bold pop'; d.textContent = m; document.body.append(d); setTimeout(() => d.remove(), 3000); }
+
+function login(reg = 0) {
+  run = null;
+  app.innerHTML = `<div class="max-w-sm mx-auto pt-14 px-4 text-center"><div class="text-7xl">🌍</div><h1 class="text-4xl font-black text-green-700 my-2">ЭкоКвест</h1>
+  <p class="text-stone-600 mb-6">Проходи задания, спасай планету, собирай достижения</p>
+  <input id="l" class="inp" placeholder="Логин" autocomplete="username"><input id="p" type="password" class="inp" placeholder="Пароль (от 6 символов)" autocomplete="current-password">
+  <p id="er" class="text-red-600 min-h-6 text-sm my-1"></p>
+  <button class="btn bg-green-500 w-full" onclick="go(${reg})">${reg ? 'Создать аккаунт' : 'Войти'}</button>
+  <button class="mt-4 text-sky-600 font-bold" onclick="login(${1 - reg})">${reg ? 'У меня уже есть аккаунт' : 'Я новый игрок'}</button></div>`;
+}
+async function go(reg) { const r = await api(reg ? 'register' : 'login', { login: $('#l').value.trim(), password: $('#p').value }); r.ok ? load() : $('#er').textContent = r.err; }
+async function load() { const r = await api('state'); if (!r.ok) return login(); S = r; home(); }
+const out = () => api('logout', {}).then(login);
+
+const node = (l, i, e) => `<div class="flex flex-col items-center my-3" style="transform:translateX(${[0, 50, 0, -50][i % 4]}px)">
+  <button ${l.open && l.lv < S.max ? `onclick="start('${l.id}')"` : 'disabled'} class="circ ${l.lv >= S.max ? 'gold' : l.open ? 'on' : 'off'}">${!l.open ? '🔒' : l.lv >= S.max ? '👑' : e}</button>
+  <div class="font-bold text-sm mt-2">${l.t}</div><div class="flex gap-1 mt-1">${[1, 2, 3, 4, 5].map(k => `<i class="dot ${k <= l.lv ? 'f' : ''}"></i>`).join('')}</div>
+  ${l.cool ? `<div class="text-xs text-red-500">⏳ ${l.cool} с</div>` : ''}</div>`;
+const achv = () => `<h2 class="text-2xl font-black text-center mt-6">Мои достижения: ${S.ach.filter(a => a.got).length}/${S.ach.length}</h2><p class="text-center text-stone-500 text-sm">Нажми на значок, чтобы показать его учителю</p>
+  <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-4">${S.ach.map(a => `<button onclick="cert('${a.k}')" class="badge ${a.got ? '' : 'grayscale opacity-50'}"><span class="text-5xl">${a.e}</span><b>${a.t}</b><span class="text-stone-500">${a.d}</span></button>`).join('')}</div>`;
+function home() {
+  run = null; const m = S.me;
+  app.innerHTML = `<div class="sticky top-0 z-10 bg-white/90 backdrop-blur border-b px-4 py-2"><div class="max-w-xl mx-auto"><div class="flex items-center gap-3 font-black"><span class="text-green-700">🌿 ${m.login}</span><span class="ml-auto text-amber-500">⭐ ${m.xp}</span><span class="text-orange-500">🔥 ${m.streak}</span><button class="text-stone-400 text-sm" onclick="out()">выйти</button></div>
+  <div class="text-xs text-stone-500 mt-1">XP сегодня: ${m.today}/${m.cap}</div><div class="bar"><i style="width:${Math.min(100, m.today / m.cap * 100)}%"></i></div></div></div>
+  <main class="max-w-xl mx-auto px-4 pb-28">${tab == 'path' ? Object.keys(BR).map(b => `<h2 class="text-xl font-black mt-8 text-center">${BR[b][0]} ${BR[b][1]}</h2>` + S.lessons.filter(l => l.b == b).map((l, i) => node(l, i, BR[b][0])).join('')).join('') : achv()}</main>
+  <nav class="fixed bottom-0 inset-x-0 bg-white border-t flex justify-around py-3 font-black"><button class="${tab == 'path' ? 'text-green-600' : 'text-stone-400'}" onclick="tab='path';home()">🗺️ Путь</button><button class="${tab == 'ach' ? 'text-green-600' : 'text-stone-400'}" onclick="tab='ach';home()">🏅 Достижения</button></nav>`;
+}
+function cert(k) {
+  const a = S.ach.find(x => x.k == k); if (!a || !a.got) return toast('Достижение ещё не получено');
+  const big = /^(hero|legend)$/.test(k), m = document.createElement('div');
+  m.className = 'fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 pop'; m.onclick = () => m.remove();
+  m.innerHTML = `<div class="cert ${big ? 'big' : ''}"><div class="${big ? 'text-8xl' : 'text-7xl'}">${a.e}</div><div class="text-sm text-stone-500 mt-2">${big ? 'Сертификат' : 'Достижение'}</div><h2 class="text-3xl font-black my-2">${a.t}</h2><p>${a.d}</p>
+  <p class="mt-4 text-2xl font-black text-green-700">${S.me.login}</p><p class="text-stone-500 text-sm">Получено: ${a.got} · ⭐ ${S.me.xp} XP · 🔥 рекорд серии: ${S.me.best}</p></div>`;
+  document.body.append(m);
+}
+
+// ---------- Прохождение задания + защита от списывания ----------
+async function start(id) {
+  const r = await api('start', { lesson: id }); if (!r.ok) { toast(r.err); return load(); }
+  run = { n: r.n, live: 1 }; history.pushState({}, ''); show(r);
+}
+function show(r) {
+  clearInterval(tm); cur = null; const q = r.q; run.q = q;
+  ans = q.k == 's' ? Array(q.items.length).fill(null) : q.k == 'm' ? Array(q.l.length).fill(null) : q.k == 'k' ? q.g.map(() => 0) : null;
+  app.innerHTML = `<div class="quiz max-w-xl mx-auto p-4"><div class="flex items-center gap-3"><div class="bar flex-1"><i style="width:${r.i / run.n * 100}%"></i></div><b id="tx" class="text-sky-600 w-10 text-right"></b></div><div class="bar t mt-2"><i id="tb" style="width:100%"></i></div>
+  <h2 class="text-xl font-black my-6">${q.q}</h2><div id="body"></div><div id="fb"></div></div>`;
+  draw(); let t = r.lim;
+  tm = setInterval(() => { t -= .1; $('#tb').style.width = Math.max(0, t / r.lim * 100) + '%'; $('#tx').textContent = Math.ceil(t); if (t <= 0) { clearInterval(tm); ans = null; send(); } }, 100);
+}
+const put = j => { if (cur != null) { ans[cur] = j; cur = null; draw(); } };
+const pair = j => { if (cur != null) { ans[cur] = j; cur = null; draw(); } };
+function draw() {
+  const q = run.q; let h = '', ready = true;
+  if (q.k == 'c') { h = q.o.map((o, i) => `<button class="opt ${ans === i ? 'sel' : ''}" onclick="ans=${i};draw()">${o}</button>`).join(''); ready = ans !== null; }
+  if (q.k == 's') {
+    h = `<div class="flex flex-wrap mb-4 min-h-10">${q.items.map((o, i) => ans[i] == null ? `<span draggable="true" ondragstart="cur=${i}" onclick="cur=${i};draw()" class="chip ${cur === i ? 'sel' : ''}">${o}</span>` : '').join('') || '✅'}</div>
+    <div class="grid grid-cols-2 gap-3">${q.bins.map((n, j) => `<div ondragover="event.preventDefault()" ondrop="put(${j})" onclick="put(${j})" class="bin"><b>${n}</b><div>${q.items.map((o, i) => ans[i] === j ? `<span class="chip" onclick="event.stopPropagation();ans[${i}]=null;draw()">${o}</span>` : '').join('')}</div></div>`).join('')}</div><p class="text-xs text-stone-500 mt-2">Выбери предмет и нажми на контейнер (или перетащи)</p>`;
+    ready = ans.every(x => x != null);
+  }
+  if (q.k == 'm') {
+    h = `<div class="grid grid-cols-2 gap-3"><div>${q.l.map((o, i) => `<button class="opt ${cur === i ? 'sel' : ''}" onclick="cur=${i};draw()">${o}${ans[i] != null ? `<br><small class="text-sky-700">→ ${q.r[ans[i]]}</small>` : ''}</button>`).join('')}</div>
+    <div>${q.r.map((o, j) => `<button class="opt" ${ans.includes(j) ? 'disabled' : ''} onclick="pair(${j})">${o}</button>`).join('')}</div></div>`;
+    ready = ans.every(x => x != null);
+  }
+  if (q.k == 'k') {
+    const sum = Math.round(q.g.reduce((s, g, i) => s + g[1][ans[i]][1], 0) * 10) / 10;
+    h = q.g.map((g, gi) => `<div class="mb-3"><b>${g[0]}</b><div>${g[1].map((o, oi) => `<button class="opt chip ${ans[gi] == oi ? 'sel' : ''}" style="width:auto;display:inline-block" onclick="ans[${gi}]=${oi};draw()">${o[0]} · ${o[1]} кг</button>`).join('')}</div></div>`).join('') + `<p class="font-black text-lg ${sum <= q.limit ? 'text-green-600' : 'text-red-600'}">Твой след: ${sum} кг CO₂ (цель ≤ ${q.limit})</p>`;
+  }
+  $('#body').innerHTML = h + `<button class="btn bg-green-500 w-full mt-6" ${ready ? '' : 'disabled'} onclick="send()">Ответить</button>`;
+}
+async function send() {
+  clearInterval(tm); $('#body').style.pointerEvents = 'none';
+  const r = await api('answer', { a: ans }); if (r.over) return gone();
+  $('#fb').innerHTML = `<div class="fb pop ${r.right ? 'good' : 'bad'}">${r.right ? '🎉 Верно!' : r.late ? '⏰ Время вышло' : '❌ Неверно'}${r.e ? `<p class="mt-1">${r.e}</p>` : ''}</div>`;
+  setTimeout(() => run && run.live && (r.end ? fin(r) : show(r)), r.wait);
+}
+async function fin(r) {
+  run.live = 0; const s = await api('state'); if (s.ok) S = s;
+  app.innerHTML = `<div class="max-w-xl mx-auto p-6 text-center pop"><div class="text-8xl">${r.pass ? '🏆' : '😕'}</div><h1 class="text-3xl font-black my-3">${r.pass ? 'Уровень пройден!' : 'Не получилось'}</h1>
+  ${r.pass ? `<div class="xp">+${r.xp} XP</div><p class="font-bold">🔥 Серия: ${r.streak} дн.${r.perfect ? ' · 💎 Без ошибок' : ''}</p>` : `<p class="text-stone-600">${r.late ? 'Время вышло. ' : ''}Повтори тему и приходи через 3 минуты — вопросы будут в другом порядке.</p>`}
+  ${(r.newAch || []).map(a => `<button class="badge mt-4 w-full pop" onclick="cert('${a.k}')"><span class="text-5xl">${a.e}</span><b>Новое достижение: ${a.t}</b><span>Нажми, чтобы показать учителю</span></button>`).join('')}
+  <button class="btn bg-green-500 w-full mt-6" onclick="home()">Продолжить</button></div>`;
+}
+function gone() { if (run) run.live = 0; clearInterval(tm); app.innerHTML = `<div class="max-w-sm mx-auto pt-20 px-4 text-center"><div class="text-7xl">🚫</div><h1 class="text-2xl font-black my-3">Задание сброшено</h1><p class="text-stone-600">Ты покинул страницу во время задания. Прогресс не засчитан, повтор — через 3 минуты.</p><button class="btn bg-green-500 w-full mt-6" onclick="load()">Назад к заданиям</button></div>`; }
+function leave() { if (!run || !run.live) return; run.live = 0; clearInterval(tm); navigator.sendBeacon('/api/abort', new Blob(['{}'], { type: 'application/json' })); }
+const trip = () => { if (run && run.live) { leave(); gone(); } };
+document.addEventListener('visibilitychange', () => document.hidden && trip());
+addEventListener('blur', trip); addEventListener('popstate', trip); addEventListener('pagehide', leave);
+['copy', 'cut', 'paste', 'contextmenu'].forEach(t => addEventListener(t, e => run && run.live && e.preventDefault()));
+load();
+</script></body></html>

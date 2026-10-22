@@ -1,0 +1,12 @@
+{
+  "name": "eco-quest",
+  "version": "1.0.0",
+  "description": "ЭкоКвест — образовательная игра по экологии для школьников",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": ">=11.5.0",
+    "express": "^4.19.2"
+  }
+}
