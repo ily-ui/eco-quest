@@ -1,7 +1,11 @@
-const express = require('express'), Database = require('better-sqlite3'), bcrypt = require('bcryptjs'), crypto = require('crypto');
+const express = require('express'), { Pool } = require('pg'), bcrypt = require('bcryptjs'), crypto = require('crypto');
 const CAP = +process.env.DAILY_CAP || 80, MAXL = 5, COOL = 180000; // лимит XP в день, уровней в задании, кулдаун после провала (мс)
-const db = new Database(process.env.DB || 'eco.db');
-db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,login TEXT UNIQUE COLLATE NOCASE,hash TEXT,xp INT DEFAULT 0,streak INT DEFAULT 0,best INT DEFAULT 0,last TEXT,perfect INT DEFAULT 0);
+if (!process.env.DATABASE_URL) { console.error('Не задана переменная DATABASE_URL (строка подключения к PostgreSQL)'); process.exit(1); }
+const local = /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL);
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: local ? false : { rejectUnauthorized: false } });
+const q = (t, p) => pool.query(t, p).then(r => r.rows), q1 = (t, p) => q(t, p).then(r => r[0]);
+const init = () => pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,login TEXT NOT NULL,hash TEXT NOT NULL,xp INT DEFAULT 0,streak INT DEFAULT 0,best INT DEFAULT 0,last TEXT,perfect INT DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS users_login ON users(LOWER(login));
 CREATE TABLE IF NOT EXISTS sess(sid TEXT PRIMARY KEY,uid INT);
 CREATE TABLE IF NOT EXISTS prog(uid INT,les TEXT,lv INT DEFAULT 0,PRIMARY KEY(uid,les));
 CREATE TABLE IF NOT EXISTS daily(uid INT,day TEXT,xp INT DEFAULT 0,PRIMARY KEY(uid,day));
@@ -68,16 +72,14 @@ Object.values(LES).forEach(l => ACH.push(['mas_' + l.id, '⭐', 'Мастер: '
 ACH.push(['hero', '🏆', 'Эко-герой', 'Пройди все 5 уровней всей основной ветки', s => MAIN.every(i => s.lv[i] >= MAXL)]);
 ACH.push(['legend', '👑', 'Легенда планеты', 'Все уровни всех веток + серия 30 дней + 1000 XP', s => s.done >= Object.keys(LES).length * MAXL && s.best >= 30 && s.xp >= 1000]);
 const apub = a => ({ k: a[0], e: a[1], t: a[2], d: a[3] });
-
-// ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 const shuf = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1);[a[i], a[j]] = [a[j], a[i]]; } return a; };
 const day = (off = 0) => new Date(Date.now() - off * 864e5).toISOString().slice(0, 10);
-const todayXp = uid => (db.prepare('SELECT xp FROM daily WHERE uid=? AND day=?').get(uid, day()) || { xp: 0 }).xp;
-const levels = uid => { const o = {}; for (const k in LES) o[k] = 0; for (const r of db.prepare('SELECT les,lv FROM prog WHERE uid=?').all(uid)) o[r.les] = r.lv; return o; };
-const stats = uid => { const u = db.prepare('SELECT * FROM users WHERE id=?').get(uid), lv = levels(uid); return { ...u, lv, done: Object.values(lv).reduce((a, b) => a + b, 0) }; };
-function checkAch(uid) {
-  const s = stats(uid), have = new Set(db.prepare('SELECT k FROM ach WHERE uid=?').all(uid).map(r => r.k)), n = [];
-  for (const a of ACH) if (!have.has(a[0]) && a[4](s)) { db.prepare('INSERT INTO ach VALUES(?,?,?)').run(uid, a[0], day()); n.push(apub(a)); }
+const todayXp = async uid => ((await q1('SELECT xp FROM daily WHERE uid=$1 AND day=$2', [uid, day()])) || { xp: 0 }).xp;
+const levels = async uid => { const o = {}; for (const k in LES) o[k] = 0; for (const r of await q('SELECT les,lv FROM prog WHERE uid=$1', [uid])) o[r.les] = r.lv; return o; };
+const stats = async uid => { const u = await q1('SELECT * FROM users WHERE id=$1', [uid]), lv = await levels(uid); return { ...u, lv, done: Object.values(lv).reduce((a, b) => a + b, 0) }; };
+async function checkAch(uid) {
+  const s = await stats(uid), have = new Set((await q('SELECT k FROM ach WHERE uid=$1', [uid])).map(r => r.k)), n = [];
+  for (const a of ACH) if (!have.has(a[0]) && a[4](s)) { await q('INSERT INTO ach VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [uid, a[0], day()]); n.push(apub(a)); }
   return n;
 }
 // Готовим вопрос: на клиент уходит БЕЗ ответов, проверка только на сервере, порядок каждый раз случайный
@@ -94,47 +96,48 @@ const cur = (r, d = 0) => { const q = r.qs[r.i]; r.lim = Math.max(12, 45 - 6 * r
 const app = express();
 app.use(express.json({ limit: '10kb' }));
 app.use(express.static('public'));
-const mk = (res, uid) => { const sid = crypto.randomBytes(24).toString('hex'); db.prepare('INSERT INTO sess VALUES(?,?)').run(sid, uid); res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000`); };
+const ah = f => (req, res, next) => f(req, res, next).catch(e => { console.error(e); res.status(500).json({ err: 'Ошибка сервера, попробуй ещё раз' }); });
+const mk = async (res, uid) => { const sid = crypto.randomBytes(24).toString('hex'); await q('INSERT INTO sess VALUES($1,$2)', [sid, uid]); res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000`); };
 const sidOf = req => ((req.headers.cookie || '').split('; ').find(c => c.startsWith('sid=')) || '').slice(4);
-const auth = (req, res, next) => { req.u = db.prepare('SELECT u.* FROM users u JOIN sess s ON s.uid=u.id WHERE s.sid=?').get(sidOf(req)); req.u ? next() : res.status(401).json({ err: 'Войди в аккаунт' }); };
+const auth = ah(async (req, res, next) => { req.u = await q1('SELECT u.* FROM users u JOIN sess s ON s.uid=u.id WHERE s.sid=$1', [sidOf(req)]); req.u ? next() : res.status(401).json({ err: 'Войди в аккаунт' }); });
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', ah(async (req, res) => {
   const login = String(req.body.login || ''), pw = String(req.body.password || '');
   if (!/^[\p{L}\d_]{3,20}$/u.test(login) || pw.length < 6) return res.status(400).json({ err: 'Логин: 3–20 символов (буквы, цифры, _). Пароль: от 6 символов' });
-  try { const id = db.prepare('INSERT INTO users(login,hash) VALUES(?,?)').run(login, bcrypt.hashSync(pw, 10)).lastInsertRowid; mk(res, id); res.json({ ok: 1 }); }
-  catch { res.status(400).json({ err: 'Такой логин уже занят' }); }
-});
-app.post('/api/login', (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE login=?').get(String(req.body.login || ''));
+  try { const u = await q1('INSERT INTO users(login,hash) VALUES($1,$2) RETURNING id', [login, bcrypt.hashSync(pw, 10)]); await mk(res, u.id); res.json({ ok: 1 }); }
+  catch (e) { if (e.code == '23505') return res.status(400).json({ err: 'Такой логин уже занят' }); throw e; }
+}));
+app.post('/api/login', ah(async (req, res) => {
+  const u = await q1('SELECT * FROM users WHERE LOWER(login)=LOWER($1)', [String(req.body.login || '')]);
   if (!u || !bcrypt.compareSync(String(req.body.password || ''), u.hash)) return res.status(401).json({ err: 'Неверный логин или пароль' });
-  mk(res, u.id); res.json({ ok: 1 });
-});
-app.post('/api/logout', (req, res) => { db.prepare('DELETE FROM sess WHERE sid=?').run(sidOf(req)); res.json({ ok: 1 }); });
+  await mk(res, u.id); res.json({ ok: 1 });
+}));
+app.post('/api/logout', ah(async (req, res) => { await q('DELETE FROM sess WHERE sid=$1', [sidOf(req)]); res.json({ ok: 1 }); }));
 
-app.get('/api/state', auth, (req, res) => {
-  const u = req.u, lv = levels(u.id), got = new Map(db.prepare('SELECT k,at FROM ach WHERE uid=?').all(u.id).map(r => [r.k, r.at]));
+app.get('/api/state', auth, ah(async (req, res) => {
+  const u = req.u, lv = await levels(u.id), got = new Map((await q('SELECT k,at FROM ach WHERE uid=$1', [u.id])).map(r => [r.k, r.at]));
   res.json({
-    me: { login: u.login, xp: u.xp, streak: u.streak, best: u.best, today: todayXp(u.id), cap: CAP },
+    me: { login: u.login, xp: u.xp, streak: u.streak, best: u.best, today: await todayXp(u.id), cap: CAP },
     lessons: Object.values(LES).map(l => ({ id: l.id, b: l.b, t: l.t, lv: lv[l.id], open: open(l, lv), cool: Math.max(0, Math.ceil(((cool.get(u.id + l.id) || 0) - Date.now()) / 1000)) })),
     ach: ACH.map(a => ({ ...apub(a), got: got.get(a[0]) || null })), max: MAXL
   });
-});
+}));
 
-app.post('/api/start', auth, (req, res) => {
+app.post('/api/start', auth, ah(async (req, res) => {
   const u = req.u, l = LES[req.body.lesson], err = (c, m) => res.status(c).json({ err: m });
   if (!l) return err(400, 'Нет такого задания');
-  const L = levels(u.id);
+  const L = await levels(u.id);
   if (!open(l, L)) return err(403, 'Задание пока закрыто');
   if (L[l.id] >= MAXL) return err(400, 'Задание пройдено на максимум');
   const w = (cool.get(u.id + l.id) || 0) - Date.now();
   if (w > 0) return err(429, `Подожди ещё ${Math.ceil(w / 1000)} сек.`);
-  if (todayXp(u.id) >= CAP) return err(429, 'Дневной лимит XP набран. Возвращайся завтра!');
+  if (await todayXp(u.id) >= CAP) return err(429, 'Дневной лимит XP набран. Возвращайся завтра!');
   const old = runs.get(u.id); if (old) cool.set(u.id + old.les, Date.now() + COOL); // новая попытка при незавершённой = сброс прежней
   const r = { les: l.id, lvl: L[l.id] + 1, qs: shuf(l.p).map(prep), i: 0, bad: 0 };
   runs.set(u.id, r); res.json({ n: r.qs.length, ...cur(r) });
-});
+}));
 
-app.post('/api/answer', auth, (req, res) => {
+app.post('/api/answer', auth, ah(async (req, res) => {
   const u = req.u, r = runs.get(u.id);
   if (!r) return res.json({ over: 1 });
   const late = Date.now() - r.qt > r.lim * 1000 + 3000;
@@ -144,19 +147,20 @@ app.post('/api/answer', auth, (req, res) => {
   if (fail || r.i >= n) {
     runs.delete(u.id);
     if (fail) { cool.set(u.id + r.les, Date.now() + COOL); return res.json({ ...out, end: 1, pass: 0 }); }
-    const perfect = r.bad == 0, xp = 10 * r.lvl + (perfect ? 5 : 0), d = day(), x = db.prepare('SELECT * FROM users WHERE id=?').get(u.id);
-    db.prepare('INSERT INTO prog VALUES(?,?,?) ON CONFLICT(uid,les) DO UPDATE SET lv=excluded.lv').run(u.id, r.les, r.lvl);
-    db.prepare('INSERT INTO daily VALUES(?,?,?) ON CONFLICT(uid,day) DO UPDATE SET xp=xp+excluded.xp').run(u.id, d, xp);
+    const perfect = r.bad == 0, xp = 10 * r.lvl + (perfect ? 5 : 0), d = day(), x = await q1('SELECT * FROM users WHERE id=$1', [u.id]);
+    await q('INSERT INTO prog VALUES($1,$2,$3) ON CONFLICT(uid,les) DO UPDATE SET lv=EXCLUDED.lv', [u.id, r.les, r.lvl]);
+    await q('INSERT INTO daily VALUES($1,$2,$3) ON CONFLICT(uid,day) DO UPDATE SET xp=daily.xp+EXCLUDED.xp', [u.id, d, xp]);
     const st = x.last == d ? x.streak : x.last == day(1) ? x.streak + 1 : 1;
-    db.prepare('UPDATE users SET xp=xp+?,streak=?,best=MAX(best,?),last=?,perfect=perfect+? WHERE id=?').run(xp, st, st, d, perfect ? 1 : 0, u.id);
-    return res.json({ ...out, end: 1, pass: 1, xp, streak: st, perfect, newAch: checkAch(u.id) });
+    await q('UPDATE users SET xp=xp+$1,streak=$2,best=GREATEST(best,$3),last=$4,perfect=perfect+$5 WHERE id=$6', [xp, st, st, d, perfect ? 1 : 0, u.id]);
+    return res.json({ ...out, end: 1, pass: 1, xp, streak: st, perfect, newAch: await checkAch(u.id) });
   }
   res.json({ ...out, ...cur(r, wait) });
-});
+}));
 
 app.post('/api/abort', auth, (req, res) => { // уход со страницы = попытка сброшена + кулдаун
   const r = runs.get(req.u.id); if (r) { cool.set(req.u.id + r.les, Date.now() + COOL); runs.delete(req.u.id); }
   res.json({ ok: 1 });
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('ЭкоКвест: http://localhost:' + (process.env.PORT || 3000)));
+const port = process.env.PORT || 3000;
+init().then(() => app.listen(port, () => console.log('ЭкоКвест: http://localhost:' + port))).catch(e => { console.error('Ошибка подключения к базе:', e.message); process.exit(1); });
